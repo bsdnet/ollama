@@ -46,6 +46,7 @@ type Scheduler struct {
 // TODO set this to zero after a release or two, to enable multiple models by default
 var loadedMax = 1          // Maximum runners; < 1 maps to as many as will fit in VRAM (unlimited for CPU runners)
 var maxQueuedRequests = 10 // TODO configurable
+var numParallel = 1
 
 func InitScheduler(ctx context.Context) *Scheduler {
 	maxRunners := os.Getenv("OLLAMA_MAX_LOADED_MODELS")
@@ -55,6 +56,14 @@ func InitScheduler(ctx context.Context) *Scheduler {
 			slog.Error("invalid setting", "OLLAMA_MAX_LOADED_MODELS", maxRunners, "error", err)
 		} else {
 			loadedMax = m
+		}
+	}
+	if onp := os.Getenv("OLLAMA_NUM_PARALLEL"); onp != "" {
+		p, err := strconv.Atoi(onp)
+		if err != nil || p <= 0 {
+			slog.Error("invalid parallel setting, must be greater than zero", "OLLAMA_NUM_PARALLEL", onp, "error", err)
+		} else {
+			numParallel = p
 		}
 	}
 
@@ -81,6 +90,8 @@ func (s *Scheduler) GetRunner(c context.Context, model *Model, opts api.Options,
 		successCh:       make(chan *runnerRef),
 		errCh:           make(chan error, 1),
 	}
+	// context split across parallel threads
+	opts.NumCtx = opts.NumCtx * numParallel
 	select {
 	case s.pendingReqCh <- req:
 	default:
@@ -135,6 +146,14 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					ggml, err := llm.LoadModel(pending.model.ModelPath)
 					if err != nil {
 						pending.errCh <- err
+						break
+					}
+
+					// If we're CPU only mode, just limit by loadedMax above
+					// TODO handle system memory exhaustion
+					if (len(gpus) == 1 && gpus[0].Library == "cpu") || pending.opts.NumGPU == 0 {
+						slog.Debug("cpu mode with existing models, loading")
+						s.loadFn(pending, ggml, gpus)
 						break
 					}
 
@@ -231,6 +250,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 						defer runner.refMu.Unlock()
 						if runner.expireTimer != nil {
 							runner.expireTimer.Stop()
+							runner.expireTimer = nil
 						}
 						s.expiredCh <- runner
 					})
@@ -277,6 +297,10 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 	runner.refCount++
+	if runner.expireTimer != nil {
+		runner.expireTimer.Stop()
+		runner.expireTimer = nil
+	}
 	runner.sessionDuration = pending.sessionDuration
 	pending.successCh <- runner
 	go func() {
@@ -407,6 +431,10 @@ type runnerRef struct {
 
 // The refMu must already be held when calling unload
 func (runner *runnerRef) unload() {
+	if runner.expireTimer != nil {
+		runner.expireTimer.Stop()
+		runner.expireTimer = nil
+	}
 	if runner.llama != nil {
 		runner.llama.Close()
 	}
@@ -421,16 +449,21 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	slog.Debug("evaluating already loaded", "model", req.model.ModelPath)
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
-	// Ignore the NumGPU settings for comparison
-	optsExisting := runner.Options.Runner
-	optsExisting.NumGPU = -1
-	optsNew := req.opts.Runner
-	optsNew.NumGPU = -1
+
 	timeout := 10 * time.Second
 	if runner.loading {
 		timeout = 2 * time.Minute // Initial load can take a long time for big models on slow systems...
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout) // BUG -
+
+	// Don't reload runner if num_gpu=-1 was provided
+	optsExisting := runner.Options.Runner
+	optsNew := req.opts.Runner
+	if optsNew.NumGPU < 0 {
+		optsExisting.NumGPU = -1
+		optsNew.NumGPU = -1
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if !reflect.DeepEqual(runner.adapters, req.model.AdapterPaths) || // have the adapters changed?
 		!reflect.DeepEqual(runner.projectors, req.model.ProjectorPaths) || // have the projectors changed?
@@ -438,6 +471,7 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 		runner.llama.Ping(ctx) != nil {
 		return true
 	}
+
 	return false
 }
 

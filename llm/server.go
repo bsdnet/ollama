@@ -73,8 +73,7 @@ func LoadModel(model string) (*GGML, error) {
 func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, projectors []string, opts api.Options) (LlamaServer, error) {
 	var err error
 	if opts.NumCtx > int(ggml.KV().ContextLength()) {
-		slog.Warn("requested context length is greater than model max context length", "requested", opts.NumCtx, "model", ggml.KV().ContextLength())
-		opts.NumCtx = int(ggml.KV().ContextLength())
+		slog.Warn("requested context length is greater than the model's training context window size", "requested", opts.NumCtx, "training size", ggml.KV().ContextLength())
 	}
 
 	if opts.NumCtx < 4 {
@@ -301,12 +300,6 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			continue
 		}
 
-		// reap subprocess when it exits
-		go func() {
-			// Exit status managed via getServerStatus
-			_ = s.cmd.Wait()
-		}()
-
 		// TODO - make sure this is all wired up correctly
 		// if err = s.WaitUntilRunning(); err != nil {
 		// 	slog.Error("error starting llama server", "server", servers[i], "error", err)
@@ -442,7 +435,7 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			slog.Info("context expired before server started")
-			return fmt.Errorf("timed out waiting for llama runner to start")
+			return fmt.Errorf("timed out waiting for llama runner to start: %w", ctx.Err())
 		case err := <-s.done:
 			msg := ""
 			if s.status != nil && s.status.LastErrMsg != "" {
@@ -560,6 +553,13 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 		return err
 	}
 	defer s.sem.Release(1)
+
+	// only allow maximum 10 "context shifts" to avoid infinite generation
+	if req.Options.NumPredict < 0 || req.Options.NumPredict > 10*s.options.NumCtx {
+		req.Options.NumPredict = 10 * s.options.NumCtx
+		slog.Debug("setting token limit to 10x num_ctx", "num_ctx", s.options.NumCtx, "num_predict", req.Options.NumPredict)
+	}
+
 	request := map[string]any{
 		"prompt":            req.Prompt,
 		"stream":            true,
@@ -893,7 +893,13 @@ func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error
 func (s *llmServer) Close() error {
 	if s.cmd != nil {
 		slog.Debug("stopping llama server")
-		return s.cmd.Process.Kill()
+		if err := s.cmd.Process.Kill(); err != nil {
+			return err
+		}
+
+		_ = s.cmd.Wait()
+
+		slog.Debug("llama server stopped")
 	}
 
 	return nil

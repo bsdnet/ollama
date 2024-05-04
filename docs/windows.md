@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Ollama Windows Preview
 
 Welcome to the Ollama Windows preview.
@@ -12,9 +13,9 @@ terminal application. As usual the Ollama [api](./api.md) will be served on
 
 As this is a preview release, you should expect a few bugs here and there.  If
 you run into a problem you can reach out on
-[Discord](https://discord.gg/ollama), or file an 
+[Discord](https://discord.gg/ollama), or file an
 [issue](https://github.com/ollama/ollama/issues).
-Logs will often be helpful in dianosing the problem (see
+Logs will often be helpful in diagnosing the problem (see
 [Troubleshooting](#troubleshooting) below)
 
 ## System Requirements
@@ -27,7 +28,7 @@ Logs will often be helpful in dianosing the problem (see
 
 Here's a quick example showing API access from `powershell`
 ```powershell
-(Invoke-WebRequest -method POST -Body '{"model":"llama2", "prompt":"Why is the sky blue?", "stream": false}' -uri http://localhost:11434/api/generate ).Content | ConvertFrom-json
+(Invoke-WebRequest -method POST -Body '{"model":"llama3", "prompt":"Why is the sky blue?", "stream": false}' -uri http://localhost:11434/api/generate ).Content | ConvertFrom-json
 ```
 
 ## Troubleshooting
